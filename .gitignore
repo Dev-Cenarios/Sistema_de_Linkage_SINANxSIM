@@ -1,0 +1,26 @@
+# =========================
+# R / RStudio
+# =========================
+
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user
+
+# =========================
+# Dados e credenciais
+# =========================
+# Bases SINAN e SIM sao sigilosas (nome, nome da mae, endereco): nenhuma
+# entra no repositorio, nem as saidas do linkage
+
+*.csv
+*.xlsx
+*.xls
+*.rds
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.zip
+bases_link/
+.Renviron
+.env

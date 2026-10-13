@@ -1,0 +1,1983 @@
+-- set limite de memoria
+PRAGMA memory_limit='16GB';
+-- set numero de processos paralelos
+PRAGMA threads=2;
+
+-- Não usada neste fluxo (dados chegam por upload, não por conexão Postgres
+-- direta); deixada desativada porque travava o processamento inteiro quando
+-- o servidor não tem acesso ao mirror de extensões do DuckDB (HTTP 404 em
+-- extensions.duckdb.org observado em teste).
+-- INSTALL postgres_scanner;
+-- LOAD postgres_scanner;
+
+-- Lista todas as tabelas e gera comandos DROP dinamicamente
+CREATE OR REPLACE TEMP TABLE tables_to_drop AS 
+SELECT table_name FROM information_schema.tables 
+WHERE table_schema = 'main' AND table_type = 'BASE TABLE';
+
+-- Apaga tabelas temporárias que seguem um padrão (ex: começam com 'tmp_')
+DROP TABLE IF EXISTS temp.tb_sinan CASCADE;
+
+/*--------------------------------------------------------------------------*/
+/* ----------------------- Lendo as bases -------------------------------- */
+/*--------------------------------------------------------------------------*/
+
+-- CREATE OR REPLACE TABLE tb_sim AS
+--SELECT * 
+--FROM read_parquet('bases_link/sim.parquet');
+
+--CREATE OR REPLACE TABLE tb_sinan AS
+--SELECT * 
+--FROM read_parquet('bases_link/sinan.parquet');
+
+/*--------------------------------------------------------------------------*/
+/* ------------- Preparando a tabela para deduplicacao e linkage ---------- */
+/*--------------------------------------------------------------------------*/
+----------------------------------------------------------------------------------------------
+--- Remove os caracteres *, ", :, e espaços em branco (\s) do início (^) e do final ($) da string.
+-----------------------------------------------------------------------------------------------
+DROP MACRO IF EXISTS clean_string;
+
+CREATE OR REPLACE MACRO clean_string(input_string) AS 
+(
+  trim(
+    REGEXP_REPLACE(
+      REGEXP_REPLACE(
+        REGEXP_REPLACE(
+          upper(
+            TRANSLATE(
+              trim(input_string),
+              'áàãâäéèêëíìîïóòõôöúùûüçÁÀÃÂÄÉÈÊËÍÌÎÏÓÒÕÔÖÚÙÛÜÇ',
+              'aaaaaeeeeiiiiooooouuuucAAAAAEEEEIIIIOOOOOUUUUC'
+            )
+          ),
+           '(^| )+(ALEGADO|IGNORADO|DESCONHECIDO|NAO INFORMADO)[., ]*', ' ', 'g'  
+        ),
+        '[^A-Z ]+', '', 'g'
+      ),
+      '\\s{2,}', ' ', 'g'
+    )
+  )
+);
+
+----------------------------------------------------------------------------------------------
+-------------------------------- Preparando a tb_sim ------------------------------------------
+-----------------------------------------------------------------------------------------------
+
+UPDATE tb_sim
+SET nome = clean_string(nome),
+    nomemae = clean_string(nomemae),
+    bairro = clean_string(bairro),
+    endereco = clean_string(endereco);
+
+-- Colocando o nome do bairro em caixa alta
+UPDATE tb_sim
+SET bairro = UPPER(bairro);
+
+
+-- Removendo a preposições da coluna 'nome'
+UPDATE tb_sim
+SET nome = TRIM(
+    regexp_replace(
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(
+                    regexp_replace(
+                        regexp_replace(UPPER(nome), ' DE ', ' '), 
+                    ' DO ', ' '), 
+                ' DOS ', ' '), 
+            ' DA ', ' '), 
+        ' DAS ', ' '), 
+    ' E ', ' ')
+);
+
+-- Removendo a preposições da coluna 'nomemae'
+UPDATE tb_sim
+SET nomemae = TRIM(
+    regexp_replace(
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(
+                    regexp_replace(
+                        regexp_replace(nomemae, ' DE ', ' '), 
+                    ' DO ', ' '), 
+                ' DOS ', ' '), 
+            ' DA ', ' '), 
+        ' DAS ', ' '), 
+    ' E ', ' ')
+);
+
+-- PASSO 1: Primeiro adicionar as colunas para o NOME
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS primeironome VARCHAR;
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS segundonome VARCHAR;
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS terceironome VARCHAR;
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS ultimonome VARCHAR;
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS semultimonome VARCHAR;
+
+-- PASSO 2: Adicionar as colunas para o NOMEMAE
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS primeironomemae VARCHAR;
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS segundonomemae VARCHAR;
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS terceironomemae VARCHAR;
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS ultimonomemae VARCHAR;
+ALTER TABLE tb_sim ADD COLUMN IF NOT EXISTS semultimonomemae VARCHAR;
+
+-- Extraindo o primeiro, segundo e terceiro e ultimonome do 'NOME'
+UPDATE tb_sim
+SET primeironome = SUBSTR(nome, 1, INSTR(nome, ' ') - 1),
+    segundonome = CASE
+                     WHEN LENGTH(nome) - LENGTH(REPLACE(nome, ' ', '')) >= 1
+                     THEN SUBSTR(nome, 
+                                 INSTR(nome, ' ') + 1, 
+                                 INSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), ' ') - 1)
+                     ELSE ''
+                  END,
+    terceironome = CASE
+                      WHEN LENGTH(nome) - LENGTH(REPLACE(nome, ' ', '')) >= 2
+                      THEN SUBSTR(
+                          SUBSTR(nome, INSTR(nome, ' ') + 1),
+                          INSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), ' ') + 1,
+                          CASE 
+                              WHEN INSTR(SUBSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), INSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), ' ') + 1), ' ') > 0 
+                              THEN INSTR(SUBSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), INSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), ' ') + 1), ' ') - 1
+                              ELSE LENGTH(SUBSTR(nome, INSTR(nome, ' ') + 1))
+                          END
+                      )
+                      ELSE ''
+                   END,
+   ultimonome = SUBSTR(nome, LENGTH(nome) - INSTR(REVERSE(nome), ' ') + 2)
+WHERE INSTR(nome, ' ') > 0;
+
+
+-- Extraindo o primeiro, segundo e terceiro e ultimonome do 'NOMEMAE'
+
+UPDATE tb_sim
+SET primeironomemae = SUBSTR(nomemae, 1, INSTR(nomemae, ' ') - 1),
+    segundonomemae = CASE
+                        WHEN LENGTH(nomemae) - LENGTH(REPLACE(nomemae, ' ', '')) >= 1
+                        THEN TRIM(SUBSTR(nomemae, 
+                                         INSTR(nomemae, ' ') + 1, 
+                                         INSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), ' ') - 1))
+                        ELSE ''
+                     END,
+    terceironomemae = CASE
+                         WHEN LENGTH(nomemae) - LENGTH(REPLACE(nomemae, ' ', '')) >= 2
+                         THEN TRIM(SUBSTR(
+                             SUBSTR(nomemae, INSTR(nomemae, ' ') + 1),
+                             INSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), ' ') + 1,
+                             CASE 
+                                 WHEN INSTR(SUBSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), INSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), ' ') + 1), ' ') > 0 
+                                 THEN INSTR(SUBSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), INSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), ' ') + 1), ' ') - 1
+                                 ELSE LENGTH(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1))
+                             END
+                         ))
+                         ELSE ''
+                      END,
+   ultimonomemae = TRIM(SUBSTR(nomemae, LENGTH(nomemae) - INSTR(REVERSE(nomemae), ' ') + 2))
+WHERE INSTR(nomemae, ' ') > 0;
+
+
+-- Atualiza os valores removendo o último sobrenome
+UPDATE tb_sim
+SET semultimonome = REGEXP_REPLACE(nome, '\s+\S+$', ''),
+    semultimonomemae = REGEXP_REPLACE(nomemae, '\s+\S+$', '');
+
+----------------------------------------------------------------------------------------------
+-------------------------------- Preparando a tb_sinan ------------------------------------------
+-----------------------------------------------------------------------------------------------
+
+UPDATE tb_sinan
+SET nome = clean_string(nome),
+    nomemae = clean_string(nomemae),
+    bairro = clean_string(bairro),
+    endereco = clean_string(endereco);
+
+-- Colocando o nome do bairro em caixa alta
+UPDATE tb_sinan
+SET bairro = UPPER(bairro);
+
+
+-- Removendo a preposições da coluna 'nome'
+UPDATE tb_sinan
+SET nome = TRIM(
+    regexp_replace(
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(
+                    regexp_replace(
+                        regexp_replace(UPPER(nome), ' DE ', ' '), 
+                    ' DO ', ' '), 
+                ' DOS ', ' '), 
+            ' DA ', ' '), 
+        ' DAS ', ' '), 
+    ' E ', ' ')
+);
+
+-- Removendo a preposições da coluna 'nomemae'
+UPDATE tb_sinan
+SET nomemae = TRIM(
+    regexp_replace(
+        regexp_replace(
+            regexp_replace(
+                regexp_replace(
+                    regexp_replace(
+                        regexp_replace(nomemae, ' DE ', ' '), 
+                    ' DO ', ' '), 
+                ' DOS ', ' '), 
+            ' DA ', ' '), 
+        ' DAS ', ' '), 
+    ' E ', ' ')
+);
+
+-- PASSO 1: Primeiro adicionar as colunas para o NOME
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS primeironome VARCHAR;
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS segundonome VARCHAR;
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS terceironome VARCHAR;
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS ultimonome VARCHAR;
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS semultimonome VARCHAR;
+
+-- PASSO 2: Adicionar as colunas para o NOMEMAE
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS primeironomemae VARCHAR;
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS segundonomemae VARCHAR;
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS terceironomemae VARCHAR;
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS ultimonomemae VARCHAR;
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS semultimonomemae VARCHAR;
+
+-- Extraindo o primeiro, segundo e terceiro e ultimonome do 'NOME'
+UPDATE tb_sinan
+SET primeironome = SUBSTR(nome, 1, INSTR(nome, ' ') - 1),
+    segundonome = CASE
+                     WHEN LENGTH(nome) - LENGTH(REPLACE(nome, ' ', '')) >= 1
+                     THEN SUBSTR(nome, 
+                                 INSTR(nome, ' ') + 1, 
+                                 INSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), ' ') - 1)
+                     ELSE ''
+                  END,
+    terceironome = CASE
+                      WHEN LENGTH(nome) - LENGTH(REPLACE(nome, ' ', '')) >= 2
+                      THEN SUBSTR(
+                          SUBSTR(nome, INSTR(nome, ' ') + 1),
+                          INSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), ' ') + 1,
+                          CASE 
+                              WHEN INSTR(SUBSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), INSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), ' ') + 1), ' ') > 0 
+                              THEN INSTR(SUBSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), INSTR(SUBSTR(nome, INSTR(nome, ' ') + 1), ' ') + 1), ' ') - 1
+                              ELSE LENGTH(SUBSTR(nome, INSTR(nome, ' ') + 1))
+                          END
+                      )
+                      ELSE ''
+                   END,
+   ultimonome = SUBSTR(nome, LENGTH(nome) - INSTR(REVERSE(nome), ' ') + 2)
+WHERE INSTR(nome, ' ') > 0;
+
+
+-- Extraindo o primeiro, segundo e terceiro e ultimonome do 'NOMEMAE'
+
+UPDATE tb_sinan
+SET primeironomemae = SUBSTR(nomemae, 1, INSTR(nomemae, ' ') - 1),
+    segundonomemae = CASE
+                        WHEN LENGTH(nomemae) - LENGTH(REPLACE(nomemae, ' ', '')) >= 1
+                        THEN TRIM(SUBSTR(nomemae, 
+                                         INSTR(nomemae, ' ') + 1, 
+                                         INSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), ' ') - 1))
+                        ELSE ''
+                     END,
+    terceironomemae = CASE
+                         WHEN LENGTH(nomemae) - LENGTH(REPLACE(nomemae, ' ', '')) >= 2
+                         THEN TRIM(SUBSTR(
+                             SUBSTR(nomemae, INSTR(nomemae, ' ') + 1),
+                             INSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), ' ') + 1,
+                             CASE 
+                                 WHEN INSTR(SUBSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), INSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), ' ') + 1), ' ') > 0 
+                                 THEN INSTR(SUBSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), INSTR(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1), ' ') + 1), ' ') - 1
+                                 ELSE LENGTH(SUBSTR(nomemae, INSTR(nomemae, ' ') + 1))
+                             END
+                         ))
+                         ELSE ''
+                      END,
+   ultimonomemae = TRIM(SUBSTR(nomemae, LENGTH(nomemae) - INSTR(REVERSE(nomemae), ' ') + 2))
+WHERE INSTR(nomemae, ' ') > 0;
+
+
+-- Atualiza os valores removendo o último sobrenome
+UPDATE tb_sinan
+SET semultimonome = REGEXP_REPLACE(nome, '\s+\S+$', ''),
+    semultimonomemae = REGEXP_REPLACE(nomemae, '\s+\S+$', '');
+
+/*========================== Deduplicação ====================================*/
+--------------------- Sinan -----------------------------------------------
+/*------------------------------------------------------------------------
+-- Primeira Passada - Adicionando Identificador e Hash Determinístico
+------------------------------------------------------------------------*/
+
+-- Adicionar a coluna 'id' como identificador único, se não existir
+ALTER TABLE tb_sinan ADD COLUMN IF NOT EXISTS id INTEGER;
+
+-- Preencher a coluna 'id' com uma sequência numérica única
+-- Criar uma tabela temporária com a nova estrutura incluindo 'id' e 'hash_deterministico'
+CREATE OR REPLACE TEMP TABLE temp_tb_sinan AS
+SELECT
+    ROW_NUMBER() OVER () AS id, -- Gera um identificador único para cada linha
+    *,
+    MD5(nome || nomemae || dtnasc) AS hash_deterministico
+    -- Combina os campos NOME, NOMEMAE e DTNASC para gerar um hash determinístico
+FROM tb_sinan;
+
+-- Substituir a tabela original pela versão atualizada
+DROP TABLE tb_sinan;
+ALTER TABLE temp_tb_sinan RENAME TO tb_sinan;
+
+
+/*------------------------------------------------------------------------
+-- Deduplicação Determinística (com base no Hash)
+------------------------------------------------------------------------*/
+
+-- Adicionar a coluna 'id2' para deduplicação, se não existir
+ALTER TABLE tb_sinan
+ADD COLUMN IF NOT EXISTS id2 INTEGER;
+
+-- Atualizar a coluna 'id2' com o menor 'id' dentro de cada grupo de hash determinístico
+WITH hash_min_id AS (
+    SELECT
+        hash_deterministico,
+        MIN(id) AS id2_min
+    FROM tb_sinan
+    GROUP BY hash_deterministico
+)
+UPDATE tb_sinan AS m
+SET id2 = h.id2_min
+FROM hash_min_id AS h
+WHERE m.hash_deterministico = h.hash_deterministico;
+
+-- Criar uma tabela temporária para identificar duplicados com id2 diferentes
+CREATE OR REPLACE TEMP TABLE temp_duplicates_deterministic AS
+SELECT
+    a.id AS id1,
+    b.id AS id2,
+    a.hash_deterministico
+FROM tb_sinan AS a
+JOIN tb_sinan AS b
+    ON a.hash_deterministico = b.hash_deterministico
+WHERE a.id2 <> b.id2  -- Somente registros com id2 diferentes
+  AND a.id < b.id     -- Evita comparações duplicadas (a, b) e (b, a)
+GROUP BY a.id, b.id, a.hash_deterministico;
+
+-- Substituir id2 NULL pelo próprio id
+UPDATE tb_sinan
+SET id2 = id
+WHERE id2 IS NULL;
+
+
+/*------------------------------------------------------------------------
+-- Deduplicação Probabilística (Deduplição em ciclos)
+------------------------------------------------------------------------*/
+
+
+/*------------------------------------------------------------------------
+-- Primeira Passada
+------------------------------------------------------------------------*/
+
+-- Criar uma tabela temporária para armazenar os pares duplicados probabilísticos
+CREATE OR REPLACE TEMP TABLE temp_duplicates_probabilistic AS
+WITH RECURSIVE duplicates AS (
+    -- Primeira Iteração: Identificação Inicial de Duplicatas
+    SELECT
+        LEAST(p1.id2, p2.id2) AS id1,
+        GREATEST(p1.id2, p2.id2) AS id2
+    FROM tb_sinan p1
+    JOIN tb_sinan p2
+        ON p1.id < p2.id
+        AND p1.id2 <> p2.id2 -- Apenas registros com id2 diferentes
+    WHERE p1.dtnasc = p2.dtnasc
+      -- AND p1.sexo = p2.sexo
+      AND jaro_winkler_similarity(p1.nome, p2.nome) > 0.90
+      AND jaro_similarity(p1.primeironome, p2.primeironome) > 0.90
+      AND jaro_similarity(p1.segundonome, p2.segundonome) > 0.85
+      AND jaro_similarity(p1.terceironome, p2.terceironome) > 0.85
+      AND (
+          (p1.nomemae IS NOT NULL AND p2.nomemae IS NOT NULL
+              AND jaro_similarity(p1.primeironomemae, p2.primeironomemae) > 0.90
+              AND jaro_similarity(p1.segundonomemae, p2.segundonomemae) > 0.85)
+          OR
+          (p1.nomemae IS NULL OR p2.nomemae IS NULL)
+      )
+    UNION
+    SELECT
+        LEAST(d.id1, p.id2) AS id1,
+        GREATEST(d.id2, p.id2) AS id2
+    FROM duplicates d
+    JOIN tb_sinan p
+        ON d.id2 = p.id2
+)
+SELECT DISTINCT id1, id2
+FROM duplicates;
+
+-- Atualizar id2 na tabela com os pares probabilísticos identificados
+UPDATE tb_sinan AS m
+SET id2 = t.id1
+FROM temp_duplicates_probabilistic AS t
+WHERE m.id = t.id2;
+
+-- Substituir id2 NULL pelo próprio id
+UPDATE tb_sinan
+SET id2 = id
+WHERE id2 IS NULL;
+
+/*------------------------------------------------------------------------
+-- segunda Passada
+------------------------------------------------------------------------*/
+-- Segunda Passada Probabilística: Comparar apenas registros com id2 diferentes
+CREATE OR REPLACE TEMP TABLE temp_duplicates_probabilistic_second_pass AS
+WITH RECURSIVE duplicates AS (
+    -- Primeira Iteração: Identificação Inicial de Duplicatas
+    SELECT
+        LEAST(p1.id2, p2.id2) AS id1,
+        GREATEST(p1.id2, p2.id2) AS id2
+    FROM tb_sinan p1
+    JOIN tb_sinan p2
+        ON p1.id < p2.id
+        AND p1.id2 <> p2.id2 -- Somente registros com id2 diferentes
+    WHERE p1.dtnasc = p2.dtnasc
+      -- AND p1.sexo = p2.sexo
+      AND jaro_winkler_similarity(p1.nome, p2.nome) > 0.90
+      AND jaro_similarity(p1.primeironome, p2.primeironome) > 0.90
+      AND jaro_similarity(p1.segundonome, p2.segundonome) > 0.85
+      AND jaro_similarity(p1.terceironome, p2.terceironome) > 0.85
+      AND (
+          (p1.nomemae IS NOT NULL AND p2.nomemae IS NOT NULL
+              AND jaro_similarity(p1.primeironomemae, p2.primeironomemae) > 0.90
+              AND jaro_similarity(p1.segundonomemae, p2.segundonomemae) > 0.85)
+          OR
+          (p1.nomemae IS NULL OR p2.nomemae IS NULL)
+      )
+    UNION
+    -- Iterações Recursivas
+    SELECT
+        LEAST(d.id1, p.id2) AS id1,
+        GREATEST(d.id2, p.id2) AS id2
+    FROM duplicates d
+    JOIN tb_sinan p
+        ON d.id2 = p.id2
+)
+-- Seleção Final
+SELECT DISTINCT id1, id2
+FROM duplicates;
+
+-- Atualizar a coluna id2 na tabela master_final com os resultados da segunda passada
+UPDATE tb_sinan AS m
+SET id2 = t.id1
+FROM temp_duplicates_probabilistic_second_pass AS t
+WHERE m.id = t.id2
+  AND m.id2 <> t.id1; -- Atualiza apenas registros com id2 diferentes
+
+-- Substituir id2 NULL pelo próprio id (caso algum registro não seja duplicado após a segunda passada)
+UPDATE tb_sinan
+SET id2 = id
+WHERE id2 IS NULL;
+
+
+/*------------------------------------------------------------------------
+-- Terceira Passada
+------------------------------------------------------------------------*/
+-- Terceira Passada Probabilística com Critérios Adicionais
+CREATE OR REPLACE TEMP TABLE temp_duplicates_third_pass AS
+WITH RECURSIVE duplicates AS (
+    -- Primeira Iteração: Identificação Inicial de Duplicatas
+    SELECT
+        LEAST(p1.id2, p2.id2) AS id1,
+        GREATEST(p1.id2, p2.id2) AS id2
+    FROM tb_sinan p1
+    JOIN tb_sinan p2
+        ON p1.id < p2.id
+        AND p1.id2 <> p2.id2 -- Apenas registros com id2 diferentes
+    WHERE p1.dtnasc = p2.dtnasc -- Mesma data de nascimento
+      -- AND p1.SEXO = p2.SEXO -- Mesmo sexo
+      AND jaro_winkler_similarity(p1.nome, p2.nome) > 0.90 -- Similaridade pelo nome completo
+      AND jaro_winkler_similarity(p1.primeironome, p2.primeironome) > 0.90 -- Primeiro nome
+      AND jaro_winkler_similarity(p1.segundonome, p2.segundonome) > 0.85 -- Segundo nome
+      AND jaro_winkler_similarity(p1.terceironome, p2.terceironome) > 0.85 -- Terceiro nome
+      AND (
+          (p1.nomemae IS NOT NULL AND p2.nomemae IS NOT NULL -- Se o nome da mãe não for nulo
+              AND jaro_winkler_similarity(p1.primeironomemae, p2.primeironomemae) > 0.90 -- Primeiro nome da mãe
+              AND jaro_winkler_similarity(p1.segundonomemae, p2.segundonomemae) > 0.85) -- Segundo nome da mãe
+          OR
+          (p1.nomemae IS NULL OR p2.nomemae IS NULL) -- Se o nome da mãe for nulo, ignora
+      )
+    UNION
+    -- Iterações Recursivas
+    SELECT
+        LEAST(d.id1, p.id2) AS id1,
+        GREATEST(d.id2, p.id2) AS id2
+    FROM duplicates d
+    JOIN tb_sinan p
+        ON d.id2 = p.id2
+)
+-- Seleção Final
+SELECT DISTINCT id1, id2
+FROM duplicates;
+
+-- Atualizar a coluna id2 na tabela master_final com os resultados da terceira passada
+UPDATE tb_sinan AS m
+SET id2 = t.id1
+FROM temp_duplicates_third_pass AS t
+WHERE m.id = t.id2
+  AND m.id2 <> t.id1; -- Atualiza apenas registros com id2 diferentes
+
+-- Substituir id2 NULL pelo próprio id (caso algum registro não seja duplicado após a terceira passada)
+UPDATE tb_sinan
+SET id2 = id
+WHERE id2 IS NULL;
+
+-- Renomeia a coluna id2 para id_sinan
+ALTER TABLE tb_sinan RENAME COLUMN id2 TO id_sinan;
+
+ALTER TABLE tb_sinan DROP COLUMN id;
+ALTER TABLE tb_sinan DROP COLUMN id_1;
+ALTER TABLE tb_sinan DROP COLUMN hash_deterministico;
+
+-------------------------------------------------------------------------------
+/***************** Gerando a tabela tb_sinan original    **********************/
+
+CREATE OR REPLACE TABLE tb_sinan AS
+SELECT  *,
+FROM tb_sinan
+order by nome;
+
+--COPY tb_sinan TO 'bases_link/tb_sinan_id.csv' (FORMAT csv);
+-------------------------------------------------------------------------------
+/***************** Gerando a tabela do sinan deduplicados    **********************/
+--------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE tb_sinan_dedup AS
+SELECT DISTINCT ON (id_sinan) *
+FROM tb_sinan
+ORDER BY id_sinan, dtnotific DESC;
+
+-----------------------------------------------------------------
+-- Tabela dos registros  -----------
+-----------------------------------------------------------------
+--COPY tb_sinan_dedup TO 'bases_link/tb_sinan_dedup.csv' (FORMAT csv);
+
+-------------------------------------------------------------------------------
+/***************** Gerando a tabela do sinan somente os duplicados **************/
+--------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE tb_sinan_duplicados AS
+SELECT * 
+FROM tb_sinan
+WHERE id_sinan IN (
+    SELECT id_sinan
+    FROM tb_sinan
+    GROUP BY id_sinan
+    HAVING COUNT(*) > 1
+)
+ORDER BY id_sinan, nome;
+
+---------------------------------------------------------------
+-- Tabela dos registros que aparecem mais de uma vez -----------
+-----------------------------------------------------------------
+--COPY tb_sinan_duplicados TO 'bases_link/tb_sinan_duplicados.csv' (FORMAT csv);
+
+-------------------------------------------------------------------------------------
+/***************** preparando a tb_sinan_dedup para o linkage **********************/
+CREATE OR REPLACE TABLE link_sinan AS
+SELECT 
+	id_sinan,
+	nunotific,
+	dtnotific,
+	nome,
+	nomemae,
+	dtnasc,
+	idade,
+	sexo,
+	bairro,
+	endereco,
+	codmunocor,
+	codmunres,
+	primeironome,
+	segundonome,
+	terceironome,
+	ultimonome,
+	primeironomemae,
+	segundonomemae,
+	terceironomemae,
+	ultimonomemae,
+	semultimonome,
+	semultimonomemae,
+	dia,
+	mes,
+	ano
+FROM tb_sinan_dedup
+order by nome;
+
+----------------------------------------------------------------------------
+/***************** preparando a tb_sim para o linkage **********************/
+CREATE OR REPLACE TABLE link_sim AS
+SELECT 
+	numerodo,
+    numerodn,
+    dtobito,
+	nome,
+	nomemae,
+	dtnasc,
+	idade,
+	sexo,
+	bairro,
+	endereco,
+	codmunocor,
+	codmunres,
+	anoobito,
+    causabas,
+	primeironome,
+	segundonome,
+	terceironome,
+	ultimonome,
+	primeironomemae,
+	segundonomemae,
+	terceironomemae,
+	ultimonomemae,
+	semultimonome,
+	semultimonomemae,
+	dia,
+	mes,
+	ano
+FROM tb_sim
+order by nome;
+----------------------------------------------------------------------
+-------------- Etapas para o Linkage ---------------------------------
+----------------------------------------------------------------------
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 1 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+
+CREATE OR REPLACE TABLE link1 AS
+SELECT 
+    1 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    MD5(tb1.nome || tb1.nomemae || tb1.dtnasc) AS hash_tb1,
+    MD5(tb2.nome || tb2.nomemae || tb2.dtnasc) AS hash_tb2, 
+FROM
+    link_sinan AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON
+    MD5(tb1.nome || tb1.nomemae || tb1.dtnasc) = MD5(tb2.nome || tb2.nomemae || tb2.dtnasc)
+ORDER BY nome_tb1;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta1" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta1 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    link_sinan AS tb1
+LEFT JOIN
+    link1 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 2 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+
+CREATE OR REPLACE TABLE link2 AS
+SELECT 
+    2 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    MD5(tb1.nome || tb1.semultimonomemae || tb1.dtnasc) AS hash_resta1,
+    MD5(tb2.nome || tb2.semultimonomemae || tb2.dtnasc) AS hash_sim
+FROM
+    resta1 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON
+    MD5(tb1.nome || tb1.semultimonomemae || tb1.dtnasc) = MD5(tb2.nome || tb2.semultimonomemae || tb2.dtnasc)
+ORDER BY tb1.nome;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta2" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta2 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta1 AS tb1
+LEFT JOIN
+    link2 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 3 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link3 AS
+SELECT 
+    3 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,
+    jaro_winkler_similarity(tb1.nomemae, tb2.nomemae) AS score_nomemae,
+    jaro_winkler_similarity(CAST(tb1.dtnasc AS VARCHAR), CAST(tb2.dtnasc AS VARCHAR)) AS score_dtnasc,
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.nomemae, tb2.nomemae) + 
+     jaro_winkler_similarity(CAST(tb1.dtnasc AS VARCHAR), CAST(tb2.dtnasc AS VARCHAR))) / 3 AS score_medio
+FROM
+    resta2 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironome = tb2.primeironome
+AND 
+    tb1.segundonome = tb2.segundonome
+AND 
+    tb1.segundonomemae = tb2.segundonomemae
+AND 
+    tb1.primeironomemae = tb2.primeironomemae
+AND
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.nomemae, tb2.nomemae) + 
+     jaro_winkler_similarity(CAST(tb1.dtnasc AS VARCHAR), CAST(tb2.dtnasc AS VARCHAR))) / 3 > 0.96
+ORDER BY score_medio;
+
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta3" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta3 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta2 AS tb1
+LEFT JOIN
+    link3 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 4 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link4 AS
+SELECT 
+    4 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,
+    jaro_winkler_similarity(tb1.nomemae, tb2.nomemae) AS score_nomemae,
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.nomemae, tb2.nomemae))/2 AS score_medio
+FROM
+    resta3 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironome = tb2.primeironome
+AND 
+    tb1.segundonome = tb2.segundonome
+AND 
+    tb1.primeironomemae = tb2.primeironomemae
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.mes = tb2.mes
+AND
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.nomemae, tb2.nomemae)) / 2 > 0.95
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta4" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta4 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta3 AS tb1
+LEFT JOIN
+    link4 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 5 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+
+CREATE OR REPLACE TABLE link5 AS
+SELECT 
+    5 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,
+    jaro_winkler_similarity(tb1.nomemae, tb2.nomemae) AS score_nomemae,
+    (2 * jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.nomemae, tb2.nomemae)) / 3 AS score_medio
+FROM
+    resta4 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironome = tb2.primeironome
+AND 
+    tb1.primeironomemae = tb2.primeironomemae
+AND 
+    tb1.sexo = tb2.sexo
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.mes = tb2.mes
+AND 
+    tb1.bairro = tb2.bairro
+AND
+    (2 * jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.nomemae, tb2.nomemae)) / 3 > 0.90
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta5" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta5 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta4 AS tb1
+LEFT JOIN
+    link5 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 6 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+
+CREATE OR REPLACE TABLE link6 AS
+SELECT 
+    6 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,
+    jaro_winkler_similarity(tb1.nomemae, tb2.nomemae) AS score_nomemae,
+    (2 * jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.nomemae, tb2.nomemae)) / 3 AS score_medio
+FROM
+    resta5 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironome = tb2.primeironome
+AND    
+    tb1.segundonome = tb2.segundonome
+AND 
+    tb1.sexo = tb2.sexo
+AND 
+    tb1.dia = tb2.mes
+AND 
+    tb1.mes = tb2.dia
+AND 
+    tb1.bairro = tb2.bairro
+AND
+    (2 * jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.nomemae, tb2.nomemae)) / 3 > 0.91
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta6" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta6 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta5 AS tb1
+LEFT JOIN
+    link6 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 7 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link7 AS
+SELECT 
+    7 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,    
+    jaro_winkler_similarity(tb1.endereco, tb2.endereco) AS score_endereco,  
+    (2*jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.endereco, tb2.endereco)) / 3 AS score_medio
+FROM
+    resta6 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironome = tb2.primeironome
+AND 
+    tb1.sexo = tb2.sexo
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.mes = tb2.mes
+AND
+    (2*jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.endereco, tb2.endereco)) / 3 > 0.97
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta7" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta7 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta6 AS tb1
+LEFT JOIN
+    link7 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 8 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link8 AS
+SELECT 
+    8 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,    
+    jaro_winkler_similarity(tb1.semultimonomemae, tb2.semultimonomemae) AS score_semultimonomemae,  
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.semultimonomemae, tb2.semultimonomemae)) / 2 AS score_medio
+FROM
+    resta7 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironome = tb2.primeironome
+AND 
+    tb1.sexo = tb2.sexo
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.ano = tb2.ano
+AND
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(tb1.semultimonomemae, tb2.semultimonomemae)) / 2 > 0.97
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta8" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta8 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta7 AS tb1
+LEFT JOIN
+    link8 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 9 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link9 AS
+SELECT 
+    9 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,    
+    jaro_winkler_similarity(CAST(tb1.dtnasc AS VARCHAR), CAST(tb2.dtnasc AS VARCHAR)) AS score_dtnasc,  
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(CAST(tb1.dtnasc AS VARCHAR), CAST(tb2.dtnasc AS VARCHAR))) / 2 AS score_medio
+FROM
+    resta8 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironome = tb2.primeironome
+AND 
+    tb1.bairro = tb2.bairro
+AND 
+    tb1.ano = tb2.ano
+AND
+   (jaro_winkler_similarity(tb1.nome, tb2.nome) + 
+     jaro_winkler_similarity(CAST(tb1.dtnasc AS VARCHAR), CAST(tb2.dtnasc AS VARCHAR))) / 2 > 0.97
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta9" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta9 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta8 AS tb1
+LEFT JOIN
+    link9 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 10 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+
+CREATE OR REPLACE TABLE link10 AS
+SELECT 
+    10 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,
+    jaro_winkler_similarity(tb1.nomemae, tb2.nomemae) AS score_nomemae,
+    (2*jaro_similarity(tb1.nome, tb2.nome) + jaro_similarity(tb1.nomemae, tb2.nomemae))/3 AS score_medio
+FROM
+    resta9 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironome = tb2.primeironome
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.ano = tb2.ano
+AND
+   (2*jaro_similarity(tb1.nome, tb2.nome) + jaro_similarity(tb1.nomemae, tb2.nomemae))/3 > 0.94
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta10" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta10 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta9 AS tb1
+LEFT JOIN
+    link10 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 11 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link11 AS
+SELECT 
+    11 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_similarity(tb1.primeironome, tb2.primeironome) AS score_primeironome,
+    jaro_similarity(tb1.nomemae, tb2.nomemae) AS score_nomemae,
+    (jaro_similarity(tb1.primeironome, tb2.primeironome)+jaro_similarity(tb1.nomemae, tb2.nomemae))/2 AS score_medio
+FROM
+    resta10 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.segundonome = tb2.segundonome
+AND 
+    tb1.ultimonome = tb2.ultimonome
+AND 
+    tb1.primeironomemae = tb2.primeironomemae
+AND 
+    tb1.segundonomemae = tb2.segundonomemae
+AND 
+    tb1.sexo = tb2.sexo
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.ano = tb2.ano
+AND
+    (jaro_similarity(tb1.primeironome, tb2.primeironome)+jaro_similarity(tb1.nomemae, tb2.nomemae))/2 > 0.95
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta11" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta11 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta10 AS tb1
+LEFT JOIN
+    link11 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 12 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link12 AS
+SELECT 
+    12 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_similarity(tb1.primeironome, tb2.primeironome) AS score_primeironome,
+    jaro_similarity(tb1.segundonome, tb2.segundonome) AS score_segundoronome,
+    jaro_similarity(tb1.ultimonome, tb2.ultimonome) AS score_ultimonome,
+    jaro_similarity(tb1.primeironomemae, tb2.primeironomemae) AS score_primeironomemae,
+    jaro_similarity(tb1.segundonomemae, tb2.segundonomemae) AS score_segundonomemae,
+    (jaro_similarity(tb1.primeironome, tb2.primeironome)+jaro_similarity(tb1.segundonome, tb2.segundonome)+jaro_similarity(tb1.ultimonome, tb2.ultimonome)+
+    jaro_similarity(tb1.primeironomemae, tb2.primeironomemae) + jaro_similarity(tb1.segundonomemae, tb2.segundonomemae))/5 AS score_medio
+FROM
+    resta11 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.sexo = tb2.sexo
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.mes = tb2.mes
+AND 
+    tb1.ano = tb2.ano
+AND
+    (jaro_similarity(tb1.primeironome, tb2.primeironome)+jaro_similarity(tb1.segundonome, tb2.segundonome)+jaro_similarity(tb1.ultimonome, tb2.ultimonome)+
+    jaro_similarity(tb1.primeironomemae, tb2.primeironomemae) + jaro_similarity(tb1.segundonomemae, tb2.segundonomemae))/5 > 0.96
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta12" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta12 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta11 AS tb1
+LEFT JOIN
+    link12 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 13 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link13 AS
+SELECT 
+    13 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome,
+    jaro_winkler_similarity(tb1.nomemae, tb2.nomemae) AS score_nomemae,
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + jaro_winkler_similarity(tb1.nomemae, tb2.nomemae)) / 2 AS score_medio
+FROM
+    resta12 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    CAST(tb1.dtnasc AS VARCHAR) = CAST(tb2.dtnasc AS VARCHAR)
+AND 
+    tb1.primeironome = tb2.primeironome
+AND
+    (jaro_winkler_similarity(tb1.nome, tb2.nome) + jaro_winkler_similarity(tb1.nomemae, tb2.nomemae)) / 2 > 0.95
+ORDER BY score_medio;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta13" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta13 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta12 AS tb1
+LEFT JOIN
+    link13 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+---------------------------------------------------------------------------------------
+---------------------- Passagem 14 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link14 AS
+SELECT 
+    14 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome
+FROM
+    resta13 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.primeironomemae = tb2.primeironomemae
+AND    
+    tb1.sexo = tb2.sexo
+AND 
+    tb1.ano = tb2.ano
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.mes = tb2.mes
+AND 
+    jaro_winkler_similarity(tb1.nome, tb2.nome) > 0.951
+ORDER BY score_nome;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta14" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta14 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta13 AS tb1
+LEFT JOIN
+    link14 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+--------------------------------------------------------------------------------------
+---------------------- Zona Cinza ---------------------------------------------------
+---------------------- Passagem 15 -----------------------------------------------------
+----------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE link15 AS
+SELECT 
+    15 AS fase,
+    tb1.id_sinan AS id_sinan,
+    tb1.nunotific AS nunotific,
+    tb2.numerodo AS numerodo,    
+    tb1.dtnotific AS dtnotific,
+    tb2.dtobito AS dtobito,    
+    tb1.nome AS nome_tb1,
+    tb2.nome AS nome_tb2,
+    tb1.nomemae AS nomemae_tb1,
+    tb2.nomemae AS nomemae_tb2,
+    tb1.dtnasc AS dtnasc_tb1,
+    tb2.dtnasc AS dtnasc_tb2,    
+    tb1.idade AS idade_tb1,
+    tb2.idade AS idade_tb2,    
+    tb1.sexo AS sexo_tb1,
+    tb2.sexo AS sexo_tb2,
+    tb1.bairro AS bairro_tb1,
+    tb2.bairro AS bairro_tb2,
+    tb1.endereco AS endereco_tb1,
+    tb2.endereco AS endereco_tb2,    
+    tb2.anoobito AS anoobito,
+    tb2.causabas AS causabas2,    
+    tb1.codmunocor AS codmunocor_tb1,
+    tb2.codmunocor AS codmunocor_tb2,    
+    tb1.codmunres AS codmunres_tb1,   
+    tb2.codmunres AS codmunres_tb2,
+    jaro_winkler_similarity(tb1.nome, tb2.nome) AS score_nome
+FROM
+    resta14 AS tb1
+INNER JOIN
+    link_sim AS tb2
+ON    
+    tb1.sexo = tb2.sexo
+AND 
+    tb1.ano = tb2.ano
+AND 
+    tb1.dia = tb2.dia
+AND 
+    tb1.mes = tb2.mes
+AND 
+    jaro_winkler_similarity(tb1.nome, tb2.nome) > 0.97
+ORDER BY score_nome;
+
+--------------------------------------------------------------------
+-- Criação da tabela "resta15" com as colunas atualizadas
+--------------------------------------------------------------------
+CREATE OR REPLACE TABLE resta15 AS
+SELECT
+    tb1.id_sinan, tb1.nunotific, tb1.dtnotific,
+    tb1.nome, tb1.nomemae, tb1.dtnasc, tb1.sexo,
+    tb1.bairro, tb1.endereco, tb1.codmunocor,   
+    tb1.codmunres, tb1.idade,     
+    tb1.primeironome, tb1.segundonome, tb1.terceironome,   
+    tb1.ultimonome, tb1.semultimonome, tb1.primeironomemae, 
+    tb1.segundonomemae, tb1.terceironomemae,  tb1.ultimonomemae, 
+    tb1.semultimonomemae, 
+    tb1.dia, tb1.mes, tb1.ano
+FROM 
+    resta14 AS tb1
+LEFT JOIN
+    link15 AS l
+ON
+    tb1.id_sinan = l.id_sinan
+WHERE 
+    l.id_sinan IS NULL;
+
+-------------------------------------------------------------------------------------------
+-- Apendando as tabelas do linkage -------------------------------------------------------
+--------------------------------------------------------------------------------------------
+CREATE OR REPLACE TABLE tb_linkage AS 
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link1
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link2
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link3
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link4
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link5
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link6
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link7
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link8
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link9
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link10
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link11
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link12
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link13
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link14
+UNION ALL
+SELECT 
+    fase, id_sinan, nunotific, numerodo, dtnotific, dtobito, 
+    nome_tb1, nome_tb2, nomemae_tb1, nomemae_tb2, dtnasc_tb1, dtnasc_tb2,    
+    idade_tb1, idade_tb2, sexo_tb1, sexo_tb2, bairro_tb1, bairro_tb2, 
+    endereco_tb1, endereco_tb2, anoobito, causabas2,    
+    codmunocor_tb1, codmunocor_tb2, codmunres_tb1, codmunres_tb2
+FROM link15;
+
+------------------------------------------------------------------------------------------
+------------------- Excluindo as bases       ---------------------------------------------
+-----------------------------------------------------------------------------------------
+
+DROP TABLE IF EXISTS link1;
+DROP TABLE IF EXISTS link2;
+DROP TABLE IF EXISTS link3;
+DROP TABLE IF EXISTS link4;
+DROP TABLE IF EXISTS link5;
+DROP TABLE IF EXISTS link6;
+DROP TABLE IF EXISTS link7;
+DROP TABLE IF EXISTS link8;
+DROP TABLE IF EXISTS link9;
+DROP TABLE IF EXISTS link10;
+DROP TABLE IF EXISTS link11;
+DROP TABLE IF EXISTS link12;
+DROP TABLE IF EXISTS link13;
+DROP TABLE IF EXISTS link14;
+DROP TABLE IF EXISTS link15;
+
+
+DROP TABLE IF EXISTS resta1; 
+DROP TABLE IF EXISTS resta2; 
+DROP TABLE IF EXISTS resta3; 
+DROP TABLE IF EXISTS resta4; 
+DROP TABLE IF EXISTS resta5; 
+DROP TABLE IF EXISTS resta6; 
+DROP TABLE IF EXISTS resta7; 
+DROP TABLE IF EXISTS resta8; 
+DROP TABLE IF EXISTS resta9; 
+DROP TABLE IF EXISTS resta10; 
+DROP TABLE IF EXISTS resta11; 
+DROP TABLE IF EXISTS resta12; 
+DROP TABLE IF EXISTS resta13; 
+DROP TABLE IF EXISTS resta14;
+DROP TABLE IF EXISTS resta15;
+
+
+---------------------------------
+--- Deduplicando
+-----------------------------------
+CREATE OR REPLACE TABLE tb_linkage_dedup AS 
+SELECT DISTINCT ON (id_sinan, numerodo) 
+    *
+FROM 
+    tb_linkage
+ORDER BY 
+    id_sinan, numerodo;
+
+-----------------------------------------------------------------
+-- Tabela do linkage para a revisão manual dos pares formados ---
+-----------------------------------------------------------------
+--COPY tb_linkage_dedup TO 'bases_link/tb_link_revisao_manual.csv' (FORMAT csv);
+
+-------------------
+-- Exportando tb_linkage_final
+-------------------
+-- Mantem apenas o melhor par por notificacao: menor fase = criterio mais
+-- rigido (link1 deterministico ... link15 mais frouxo); empate resolvido
+-- pelo menor numerodo para o resultado ser deterministico
+CREATE OR REPLACE TABLE tb_linkage_1n AS
+SELECT id_sinan, nunotific, numerodo, fase
+FROM (
+    SELECT
+        id_sinan, nunotific, numerodo, fase,
+        ROW_NUMBER() OVER (
+            PARTITION BY nunotific
+            ORDER BY fase, numerodo
+        ) AS rn
+    FROM tb_linkage_dedup
+)
+WHERE rn = 1;
+
+-- Garante o 1:1 tambem do lado do obito: o passo acima so evita que uma
+-- notificacao SINAN tenha mais de um obito pareado, mas nao impede que o
+-- MESMO obito seja "o melhor par" de notificacoes diferentes (pessoas
+-- diferentes reivindicando o mesmo atestado de obito). Aqui, para cada
+-- numerodo, so o par de fase mais rigida sobrevive; os demais ficam sem
+-- par nesta rodada (nao registrado, nao um par errado).
+CREATE OR REPLACE TABLE tb_linkage_final AS
+SELECT id_sinan, nunotific, numerodo
+FROM (
+    SELECT
+        id_sinan, nunotific, numerodo,
+        ROW_NUMBER() OVER (
+            PARTITION BY numerodo
+            ORDER BY fase, nunotific
+        ) AS rn2
+    FROM tb_linkage_1n
+)
+WHERE rn2 = 1
+ORDER BY
+    id_sinan, numerodo;
+
+--COPY tb_linkage_final TO 'bases_link/tb_linkage.csv' (FORMAT csv);
+
+
+
+
+
+
